@@ -7,6 +7,7 @@ import (
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/settings"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/task"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -151,7 +152,7 @@ func TestApplyRunSettings(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			applyRunSettings(tt.spec, tt.resolved)
+			require.NoError(t, applyRunSettings(tt.spec, tt.resolved))
 			assert.Equal(t, tt.wantQueue, tt.spec.GetQueue())
 			assert.Equal(t, tt.wantConcurrency, tt.spec.GetMaxActionConcurrency())
 			assert.Equal(t, tt.wantPodTemplate, tt.spec.GetDefaultSettings().GetPodTemplateName())
@@ -246,11 +247,23 @@ func TestApplyRunSettingsMaps(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			applyRunSettings(tt.spec, tt.resolved)
+			require.NoError(t, applyRunSettings(tt.spec, tt.resolved))
 			assert.Equal(t, tt.wantLabels, tt.spec.GetLabels().GetValues())
 			assert.Equal(t, tt.wantAnnotations, tt.spec.GetAnnotations().GetValues())
 			assert.True(t, proto.Equal(tt.wantEnvs, tt.spec.GetEnvs()),
 				"envs: want %v, got %v", tt.wantEnvs, tt.spec.GetEnvs())
 		})
 	}
+}
+
+func TestApplyRunSettings_InvalidEntryLeavesSpecUnchanged(t *testing.T) {
+	spec := &task.RunSpec{}
+	resolved := &settings.Settings{
+		Run:    &settings.RunSettings{DefaultQueue: &settings.StringSetting{State: stateValue, StringValue: "gpu"}},
+		Labels: mapSetting(stateValue, map[string]string{"team": "ml/infra"}),
+	}
+
+	err := applyRunSettings(spec, resolved)
+	require.ErrorContains(t, err, "from settings: invalid label")
+	assert.True(t, proto.Equal(&task.RunSpec{}, spec), "spec changed: %v", spec)
 }

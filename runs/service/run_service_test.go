@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1561,6 +1562,71 @@ func TestCreateRun_RejectsInvalidPodTemplateName(t *testing.T) {
 	assert.ErrorContains(t, err, "pod template name")
 }
 
+func TestCreateRun_RejectsInvalidMetadataFromSettings(t *testing.T) {
+	// Settings are validated on write, but a row stored before that check existed can
+	// still carry a bad entry, so CreateRun checks the entries it applies from settings.
+	tests := []struct {
+		name     string
+		resolved *settings.Settings
+		runSpec  *task.RunSpec
+		wantErr  string
+	}{
+		{
+			name: "invalid label",
+			resolved: &settings.Settings{
+				Labels: mapSetting(stateValue, map[string]string{"team": "ml/infra"}),
+			},
+			wantErr: "from settings: invalid label",
+		},
+		{
+			name: "reserved label prefix",
+			resolved: &settings.Settings{
+				Labels: mapSetting(stateValue, map[string]string{"flyte.org/run": "x"}),
+			},
+			wantErr: "from settings: invalid label",
+		},
+		{
+			name: "invalid annotation",
+			resolved: &settings.Settings{
+				Annotations: mapSetting(stateValue, map[string]string{"my note": "x"}),
+			},
+			wantErr: "from settings: invalid annotations",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// As in TestCreateRun_RejectsInvalidPodTemplateName, everything after the check
+			// stays nil, so a missing check panics instead of passing.
+			svc := &RunService{
+				settingsRepo:  settingsRepoWith(t, tt.resolved),
+				projectClient: newMockProjectClientAlwaysOK(t),
+			}
+
+			req := &workflow.CreateRunRequest{
+				Id: &workflow.CreateRunRequest_RunId{
+					RunId: &common.RunIdentifier{
+						Org:     "org",
+						Project: "proj",
+						Domain:  "dev",
+						Name:    "rq-123",
+					},
+				},
+				InputWrapper: &workflow.CreateRunRequest_Inputs{Inputs: &task.Inputs{}},
+				Task: &workflow.CreateRunRequest_TaskSpec{
+					TaskSpec: &task.TaskSpec{},
+				},
+				RunSpec: tt.runSpec,
+			}
+
+			_, err := svc.CreateRun(context.Background(), connect.NewRequest(req))
+			require.Error(t, err)
+			assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
+			assert.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
 func TestCreateRun_PreservesInputContextAndRawDataPath(t *testing.T) {
 	actionRepo := &repoMocks.ActionRepo{}
 	taskRepo := &repoMocks.TaskRepo{}
@@ -1884,6 +1950,69 @@ func TestCreateRun_AppliesSettingsMaps(t *testing.T) {
 
 	actionsClient.On("Enqueue", mock.Anything, mock.MatchedBy(func(req *connect.Request[actions.EnqueueRequest]) bool {
 		return matches(req.Msg.GetRunSpec())
+	})).Return(connect.NewResponse(&actions.EnqueueResponse{}), nil).Once()
+
+	_, err := svc.CreateRun(context.Background(), connect.NewRequest(req))
+	require.NoError(t, err)
+}
+
+// Validation covers only what settings add, so a request's own labels and annotations
+// reach the TaskAction as they did before settings were applied.
+func TestCreateRun_LeavesRequestMetadataUnvalidated(t *testing.T) {
+	actionRepo := &repoMocks.ActionRepo{}
+	taskRepo := &repoMocks.TaskRepo{}
+	actionsClient := actionsconnectmocks.NewActionsServiceClient(t)
+	repo := &repoMocks.Repository{}
+	store := &storageMocks.ComposedProtobufStore{}
+	dataStore := &storage.DataStore{ComposedProtobufStore: store}
+
+	repo.On("ActionRepo").Return(actionRepo)
+	repo.On("TaskRepo").Return(taskRepo)
+
+	svc := &RunService{
+		repo: repo,
+		// The bad settings label is overridden by the request, so it is never applied.
+		settingsRepo: settingsRepoWith(t, &settings.Settings{
+			Labels: mapSetting(stateValue, map[string]string{"team": "ml/infra"}),
+		}),
+		actionsClient: actionsClient,
+		projectClient: newMockProjectClientAlwaysOK(t),
+		storagePrefix: "s3://flyte-data",
+		dataStore:     dataStore,
+	}
+
+	wantLabels := map[string]string{"team": "ml", "flyte.org/owner": "me"}
+	wantAnnotations := map[string]string{"my note": "x"}
+	req := &workflow.CreateRunRequest{
+		Id: &workflow.CreateRunRequest_RunId{
+			RunId: &common.RunIdentifier{
+				Org:     "org",
+				Project: "proj",
+				Domain:  "dev",
+				Name:    "rq-123",
+			},
+		},
+		InputWrapper: &workflow.CreateRunRequest_Inputs{Inputs: &task.Inputs{}},
+		Task: &workflow.CreateRunRequest_TaskSpec{
+			TaskSpec: &task.TaskSpec{},
+		},
+		RunSpec: &task.RunSpec{
+			Labels:      &task.Labels{Values: maps.Clone(wantLabels)},
+			Annotations: &task.Annotations{Values: maps.Clone(wantAnnotations)},
+		},
+	}
+
+	store.On("WriteProtobuf", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+	taskRepo.On("CreateTaskSpec", mock.Anything, mock.Anything).Return(nil).Once()
+	actionRepo.On("CreateAction", mock.Anything, mock.Anything, mock.Anything).Return(&models.Run{
+		Project: "proj",
+		Domain:  "dev",
+		Name:    "rq-123",
+	}, nil).Once()
+	actionsClient.On("Enqueue", mock.Anything, mock.MatchedBy(func(req *connect.Request[actions.EnqueueRequest]) bool {
+		rs := req.Msg.GetRunSpec()
+		return assert.ObjectsAreEqual(wantLabels, rs.GetLabels().GetValues()) &&
+			assert.ObjectsAreEqual(wantAnnotations, rs.GetAnnotations().GetValues())
 	})).Return(connect.NewResponse(&actions.EnqueueResponse{}), nil).Once()
 
 	_, err := svc.CreateRun(context.Background(), connect.NewRequest(req))

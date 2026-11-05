@@ -1,8 +1,12 @@
 package service
 
 import (
+	"errors"
+	"fmt"
 	"maps"
 	"slices"
+
+	"connectrpc.com/connect"
 
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/core"
 	"github.com/flyteorg/flyte/v2/gen/go/flyteidl2/settings"
@@ -12,9 +16,25 @@ import (
 // applyRunSettings fills fields the caller left unset with values resolved from
 // settings. An explicit value in the request always wins, so this only ever fills
 // gaps, and a setting that is INHERIT or UNSET contributes nothing.
-func applyRunSettings(spec *task.RunSpec, resolved *settings.Settings) {
+//
+// It returns an error, before changing spec, if a label or annotation it would add is
+// invalid. Only entries from settings are checked: the request's own entries keep
+// their existing behavior. Settings are validated on write, so this catches rows
+// stored before that check existed.
+func applyRunSettings(spec *task.RunSpec, resolved *settings.Settings) error {
 	if spec == nil {
-		return
+		return nil
+	}
+
+	// Map settings merge per key: the request's entry wins on a conflict, and the
+	// settings only add keys the request does not set.
+	labels := entriesToAdd(resolved.GetLabels(), spec.GetLabels().GetValues())
+	if err := validateLabels(labels); err != nil {
+		return fromSettings(err)
+	}
+	annotations := entriesToAdd(resolved.GetAnnotations(), spec.GetAnnotations().GetValues())
+	if err := validateAnnotations(annotations); err != nil {
+		return fromSettings(err)
 	}
 
 	if spec.GetQueue() == "" && resolved.GetRun().GetDefaultQueue().GetState() ==
@@ -51,38 +71,35 @@ func applyRunSettings(spec *task.RunSpec, resolved *settings.Settings) {
 		spec.RawDataStorage = &task.RawDataStorage{RawDataPrefix: rawDataPath.GetStringValue()}
 	}
 
-	// Map settings merge per key: the request's entry wins on a conflict, and the
-	// settings only add keys the request does not set.
-	if entries := valueEntries(resolved.GetLabels()); len(entries) > 0 {
+	if len(labels) > 0 {
 		if spec.Labels == nil {
 			spec.Labels = &task.Labels{}
 		}
-		spec.Labels.Values = fillMissing(spec.Labels.Values, entries)
+		spec.Labels.Values = withEntries(spec.Labels.Values, labels)
 	}
 
-	if entries := valueEntries(resolved.GetAnnotations()); len(entries) > 0 {
+	if len(annotations) > 0 {
 		if spec.Annotations == nil {
 			spec.Annotations = &task.Annotations{}
 		}
-		spec.Annotations.Values = fillMissing(spec.Annotations.Values, entries)
+		spec.Annotations.Values = withEntries(spec.Annotations.Values, annotations)
 	}
 
 	// Envs is a list, so the request's entries keep their order and settings entries
 	// are appended in key order, keeping the stored spec deterministic.
-	if entries := valueEntries(resolved.GetEnvironmentVariables()); len(entries) > 0 {
+	present := make(map[string]string, len(spec.GetEnvs().GetValues()))
+	for _, kv := range spec.GetEnvs().GetValues() {
+		present[kv.GetKey()] = kv.GetValue()
+	}
+	if envs := entriesToAdd(resolved.GetEnvironmentVariables(), present); len(envs) > 0 {
 		if spec.Envs == nil {
 			spec.Envs = &task.Envs{}
 		}
-		present := make(map[string]struct{}, len(spec.Envs.Values))
-		for _, kv := range spec.Envs.Values {
-			present[kv.GetKey()] = struct{}{}
-		}
-		for _, k := range slices.Sorted(maps.Keys(entries)) {
-			if _, ok := present[k]; !ok {
-				spec.Envs.Values = append(spec.Envs.Values, &core.KeyValuePair{Key: k, Value: entries[k]})
-			}
+		for _, k := range slices.Sorted(maps.Keys(envs)) {
+			spec.Envs.Values = append(spec.Envs.Values, &core.KeyValuePair{Key: k, Value: envs[k]})
 		}
 	}
+	return nil
 }
 
 // valueEntries returns the entries of a map setting, or nil unless it is in VALUE
@@ -94,16 +111,37 @@ func valueEntries(s *settings.StringMapSetting) map[string]string {
 	return s.GetMapValue().GetEntries()
 }
 
-// fillMissing copies src entries into dst for keys dst does not already have,
-// allocating dst if needed.
-func fillMissing(dst, src map[string]string) map[string]string {
+// entriesToAdd returns the VALUE entries of a map setting whose keys present does not
+// already have, or nil if there are none.
+func entriesToAdd(s *settings.StringMapSetting, present map[string]string) map[string]string {
+	var out map[string]string
+	for k, v := range valueEntries(s) {
+		if _, ok := present[k]; ok {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]string)
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// withEntries copies src into dst, allocating dst if needed.
+func withEntries(dst, src map[string]string) map[string]string {
 	if dst == nil {
 		dst = make(map[string]string, len(src))
 	}
-	for k, v := range src {
-		if _, ok := dst[k]; !ok {
-			dst[k] = v
-		}
-	}
+	maps.Copy(dst, src)
 	return dst
+}
+
+// fromSettings marks a validation error as coming from settings, since the caller
+// may not have set any label or annotation themselves.
+func fromSettings(err error) error {
+	var connectErr *connect.Error
+	if !errors.As(err, &connectErr) {
+		return err
+	}
+	return connect.NewError(connectErr.Code(), fmt.Errorf("from settings: %s", connectErr.Message()))
 }

@@ -291,7 +291,9 @@ func (s *RunService) CreateRun(
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	applyRunSettings(runSpec, resolveSettings)
+	if err := applyRunSettings(runSpec, resolveSettings); err != nil {
+		return nil, err
+	}
 	if err := validatePodTemplateName(runSpec.GetDefaultSettings().GetPodTemplateName()); err != nil {
 		return nil, err
 	}
